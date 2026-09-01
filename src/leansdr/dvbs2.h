@@ -2212,7 +2212,7 @@ namespace leansdr {
 		     pipebuf<int> *_bitcount=NULL,
 		     pipebuf<int> *_errcount=NULL)
       : runnable(sch, "S2 fecdec io"),
-	batch_size(32),
+	batch_size(8),
 	nhelpers(1),
 	must_buffer(false),
 	in(_in), out(_out),
@@ -2332,7 +2332,7 @@ namespace leansdr {
       h->fd_tx = tx[1];  close(tx[0]);
       h->fd_rx = rx[0];  close(rx[1]);
 #if 1
-      h->batch_size = 32;  // TBD
+      h->batch_size = batch_size;  // Must match ldpc_tool BLOCKS
 #else
       fprintf(stderr, "DEBUG: Assuming LDPC helper with no latency\n");
       h->batch_size = 1;  // TBD

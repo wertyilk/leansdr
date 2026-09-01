@@ -1360,6 +1360,7 @@ void usage(const char *name, FILE *f, int c, const char *info=NULL) {
     (f,
      "\nInput options:\n"
      "  --u8           Input format is 8-bit unsigned (rtl_sdr, default)\n"
+     "  --s8           Input format is 8-bit signed\n"
      "  --s12          Input format is 12/16-bit signed (PlutoSDR, LimeSDR)\n"
      "  --s16          Input format is 16-bit signed\n"
      "  --f32          Input format is 32-bit float (gqrx)\n"
@@ -1459,6 +1460,12 @@ void usage(const char *name, FILE *f, int c, const char *info=NULL) {
 }
 
 int main(int argc, const char *argv[]) {
+int stdout_flags = fcntl(1, F_GETFL, 0);
+
+  if (stdout_flags != -1) {
+    fcntl(1, F_SETFL, stdout_flags | O_NONBLOCK);
+  }
+
   config cfg;
 
   for ( int i=1; i<argc; ++i ) {

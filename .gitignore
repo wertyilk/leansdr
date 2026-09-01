@@ -1,0 +1,14 @@
+# Compiled applications (build artifacts)
+/src/apps/leandvb
+/src/apps/leandvbtx
+/src/apps/leanchansim
+/src/apps/leantsgen
+/src/apps/leansdrcat
+/src/apps/leansdrscan
+/src/apps/leansdrserv
+/src/apps/leanmlmrx
+/src/apps/leaniiorx
+/src/apps/leaniiotx
+
+# Captured / decoded MPEG-TS output
+*.ts

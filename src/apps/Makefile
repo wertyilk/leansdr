@@ -47,9 +47,12 @@ $(info libfftw3f not found. Will not build leanmlmrx.)
 endif
 
 # leaniio{rx,tx} require libiio.
-# Expected in ./libiio/, including libiio.a.
-# (Assume libiio dependencies are satisfied.)
-ifneq "$(wildcard libiio/iio.h)" ""
+# Prefer a system-installed libiio (header in /usr/include, lib in /usr/lib),
+# otherwise fall back to a bundled copy in ./libiio/.
+ifneq "$(wildcard /usr/include/iio.h)" ""
+APPS		+= leaniiorx leaniiotx
+$(OUTDIR)/leaniiorx $(OUTDIR)/leaniiotx:	LDFLAGS_APP=-liio -lpthread
+else ifneq "$(wildcard libiio/iio.h)" ""
 APPS		+= leaniiorx leaniiotx
 $(OUTDIR)/leaniiorx $(OUTDIR)/leaniiotx:	CXXFLAGS_APP=-Ilibiio
 $(OUTDIR)/leaniiorx $(OUTDIR)/leaniiotx:	LDFLAGS_APP=-Llibiio -Llibiio-$(ARCH) -L. -liio -lpthread -lxml2 -lz -llzma

@@ -32,8 +32,10 @@ See http://www.pabr.org/radio/leandvb for details and use cases.
 ## Quick start guide
 
 ```
-git clone http://github.com/pabr/leansdr.git
-cd leansdr/src/apps
+git clone http://github.com/wertyilk/leansdr.git --recursive
+cd leansdr/LDPC
+make ldpc_tool CXX="g++ -march=native"
+cd ../src/apps
 make
 ```
 
@@ -43,6 +45,11 @@ make
 rtl_sdr  -f $DOWNCONVERTED_FREQ  -s 2400000  capture.iq
 ./leandvb  -f 2400e3  --sr 2000e3  --cr 1/2   < capture.iq  > capture.ts
 mplayer capture.ts
+```
+
+### Receiving QO-100 DATV beacon:
+```
+./leandvb -f $SAMPLERATE --sr 1500e3 --standard DVB-S2 --fastlock --sampler rrc --ldpc-helper ../../LDPC/ldpc_tool --ldpc-iterations 50 < capture.iq > capture.ts
 ```
 
 ### Troubleshooting
