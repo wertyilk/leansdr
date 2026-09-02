@@ -1,3 +1,4 @@
 [submodule "LDPC"]
 	path = LDPC
 	url = https://github.com/wertyilk/LDPC.git
+    branch = master
