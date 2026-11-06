@@ -23,6 +23,7 @@
 #include <string.h>
 #include <math.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include "leansdr/framework.h"
 #include "leansdr/generic.h"
@@ -1465,6 +1466,9 @@ int stdout_flags = fcntl(1, F_GETFL, 0);
   if (stdout_flags != -1) {
     fcntl(1, F_SETFL, stdout_flags | O_NONBLOCK);
   }
+
+  // Do not die on writes to exited LDPC helpers.
+  signal(SIGPIPE, SIG_IGN);
 
   config cfg;
 

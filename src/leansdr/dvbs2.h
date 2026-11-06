@@ -26,6 +26,7 @@
 #include "leansdr/crc.h"
 #include "leansdr/bch.h"
 #include "leansdr/ldpc.h"
+#include <poll.h>
 
 namespace leansdr {
 
@@ -940,6 +941,7 @@ namespace leansdr {
 
       if ( ss.fw16<min_freqw16 || ss.fw16>max_freqw16 ) {
 	if ( sch->debug ) fprintf(stderr, "Carrier out of bounds\n");
+	in.read(ss.p-in.rd());
 	enter_frame_detect();
 	return;
       }
@@ -1669,7 +1671,19 @@ namespace leansdr {
     void run() {
       while ( in.readable()>=1 && out.writable()>=1 ) {
 	plslot<SOFTSYMB> *pin = in.rd();
-	if ( ! pin->is_pls ) fail("s2_deinterleaver: bad input sequence");
+	if ( ! pin->is_pls ) {
+	  // Slot stream is desynchronized.  This normally cannot happen
+	  // because frames are written atomically, but stay resilient:
+	  // drop slots until the next PLS marker instead of aborting.
+	  size_t skip = 0;
+	  while ( skip < in.readable() && ! in.rd()[skip].is_pls ) ++skip;
+	  if ( sch->debug )
+	    fprintf(stderr,
+		    "Warning: s2_deinterleaver: resynchronizing, skipped %zu slots\n",
+		    skip);
+	  in.read(skip);
+	  continue;
+	}
 	s2_pls *pls = &pin->pls;
 	const modcod_info *mcinfo = check_modcod(pls->modcod);
 	int nslots = pls->sf ? mcinfo->nslots_nf/4 : mcinfo->nslots_nf;
@@ -2192,6 +2206,12 @@ namespace leansdr {
     bool full() { return count == SIZE; }
     T *put() { T *res=&q[wr]; wr=(wr+1)%SIZE; ++count; return res; }
     bool empty() { return count == 0; }
+    T *at(int i) { return &q[(rd+i)%SIZE]; }
+    void remove_at(int i) {
+      for ( ; i<count-1; ++i ) *at(i) = *at(i+1);
+      wr = (wr+SIZE-1)%SIZE;
+      --count;
+    }
     const T *peek() { return &q[rd]; }
     const T *get() { const T *res=&q[rd]; rd=(rd+1)%SIZE; --count; return res; }
     //  private:
@@ -2224,33 +2244,147 @@ namespace leansdr {
       for ( int mc=0; mc<32; ++mc )
 	for ( int sf=0; sf<2; ++sf )
 	  pools[mc][sf].procs = NULL;
+      memset(dummy_buf, 0, sizeof(dummy_buf));
     }
     void run() {
-      bool work_done = false;
+      bool sent = false, received = false;
+      // Retry frames that are waiting for room in helper pipes.
+      retry_pending();
       // Send work until all helpers block.
-      bool all_blocked = false;
       while ( in.readable() >= 1 && !jobs.full() ) {
-	if ( ! send_frame(in.rd()) ) { all_blocked=true; break; }
+	if ( ! send_frame(in.rd()) ) break;
 	in.read(1);
-	work_done = true;
+	sent = true;
       }
-      // Risk blocking on read() only when we have nothing else to do
-      // and we know a result is coming.
-      while ( (all_blocked || !work_done || jobs.full()) &&
-	      !jobs.empty() &&
-	      jobs.peek()->h->b_out &&
-	      out.writable()>=1 &&
+      // Receive any ready result, regardless of queue position.
+      // A helper that has not yet filled a whole batch must not
+      // block results from other helpers (one-off modcods used to
+      // stall the whole pipeline).
+      while ( out.writable()>=1 &&
 	      opt_writable(bitcount,1) && opt_writable(errcount,1) ) {
-	receive_frame(jobs.get());
+	if ( ! receive_ready() ) break;
+	received = true;
+      }
+      // A helper only answers after a full batch, and its incomplete
+      // batch cannot be seen by the scheduler.  If we cannot send nor
+      // receive anything, frames are trapped in partial batches: pad
+      // them so that the pipeline can never wedge (e.g. bogus modcods
+      // while the demodulator is hunting for lock).
+      if ( !sent && !received && jobs.count > 0 &&
+	   out.writable()>=1 &&
+	   opt_writable(bitcount,1) && opt_writable(errcount,1) ) {
+	flush_partials();
+	while ( out.writable()>=1 &&
+		opt_writable(bitcount,1) && opt_writable(errcount,1) ) {
+	  if ( ! receive_ready() ) break;
+	}
       }
     }
   private:
+    // Complete partially-filled batches with dummy frames, so that
+    // the results of the real frames can be received.  Dummy results
+    // are discarded on receipt.
+    void flush_partials() {
+      for ( int mc=0; mc<32; ++mc )
+	for ( int sf=0; sf<2; ++sf ) {
+	  pool *p = &pools[mc][sf];
+	  if ( ! p->procs ) continue;
+	  for ( int i=0; i<p->nprocs; ++i ) {
+	    helper_instance *h = &p->procs[i];
+	    if ( h->dead ) continue;
+	    // Complete any staged frame first, so that it is not left
+	    // behind when the helper is padded to a full batch.
+	    if ( h->pending ) {
+	      int r = push_pending(h, mc, sf);
+	      if ( r < 0 ) continue;  // Helper died
+	    }
+	    int d = h->batch_size - h->b_in;
+	    if ( d <= 0 || d == h->batch_size ) continue;  // Not partial
+	    if ( jobs.count + d > simplequeue<helper_job,1024>::SIZE )
+	      continue;  // Try again when the queue drains
+	    s2_pls pls;
+	    pls.modcod = mc;
+	    pls.sf = (sf != 0);
+	    pls.pilots = false;
+	    size_t iosize = (pls.framebits()/8) * sizeof(SOFTBYTE);
+	    if ( iosize > sizeof(dummy_buf) )
+	      fail("Bug: LDPC flush frame size");
+	    for ( int k=0; k<d; ++k ) {
+	      int r = write_frame(h, dummy_buf, iosize, pls, true, mc, sf);
+	      if ( r <= 0 ) break;
+	    }
+	    if ( sch->debug )
+	      fprintf(stderr,
+		      "Flushing %d frames of partial batch: modcod=%d sf=%d\n",
+		      d, mc, sf);
+	  }
+	}
+    }
+    // Receive the oldest queued job of any helper that has a result
+    // ready, preserving FIFO order within each helper.  Return false
+    // if no result is available.
+    bool receive_ready() {
+      for ( int i=0; i<jobs.count; ++i ) {
+	helper_job *j = jobs.at(i);
+	if ( j->h->dead ) {
+	  if ( sch->debug )
+	    fprintf(stderr,
+		    "Discarding frame for dead LDPC helper: modcod=%d sf=%d\n",
+		    j->pls.modcod, j->pls.sf);
+	  jobs.remove_at(i);
+	  return true;  // Progress
+	}
+	if ( ! j->h->b_out ) continue;
+	bool oldest = true;
+	for ( int k=0; k<i; ++k )
+	  if ( jobs.at(k)->h == j->h ) { oldest=false; break; }
+	if ( ! oldest ) continue;
+	if ( j->dummy ) {
+	  // Flush padding: consume the helper's answer.
+	  const s2_pls *pls = &j->pls;
+	  size_t iosize = (pls->framebits()/8) * sizeof(ldpc_buf[0]);
+	  size_t nrd = 0;
+	  bool eof = false;
+	  while ( nrd < iosize ) {
+	    int nr = read(j->h->fd_rx, ((char*)ldpc_buf)+nrd, iosize-nrd);
+	    if ( nr < 0 ) {
+	      if ( errno == EINTR ) continue;
+	      fatal("read(LDPC helper)");
+	    }
+	    if ( ! nr ) { eof = true; break; }
+	    nrd += nr;
+	  }
+	  if ( eof )
+	    mark_dead(j->h, j->pls.modcod, j->pls.sf);
+	  else
+	    --j->h->b_out;
+	  jobs.remove_at(i);
+	  return true;  // Progress
+	}
+	if ( ! receive_frame(j) ) {
+	  // Helper exited prematurely: discard its remaining jobs.
+	  mark_dead(j->h, j->pls.modcod, j->pls.sf);
+	  jobs.remove_at(i);
+	  return true;  // Progress
+	}
+	jobs.remove_at(i);
+	return true;
+      }
+      return false;
+    }
     struct helper_instance {
       int fd_tx;       // To helper
       int fd_rx;       // From helper
       int batch_size;  // Latency
       int b_in;        // Jobs in input queue
       int b_out;       // Jobs in output queue
+      bool dead;       // Helper exited; pipes are at EOF
+      // Frame being written, or NULL.  The job is queued when the
+      // last byte reaches the helper.
+      SOFTBYTE *pending;
+      size_t pending_len, pending_size;
+      s2_pls pending_pls;
+      bool pending_dummy;
     };
     struct pool {
       helper_instance *procs;  // NULL or [nprocs]
@@ -2259,29 +2393,136 @@ namespace leansdr {
     struct helper_job {
       s2_pls pls;
       helper_instance *h;
+      bool dummy;  // Padding for a partial batch; discard result
     };
     simplequeue<helper_job,1024> jobs;
+    // Mark a helper as gone and release its pipes.
+    void mark_dead(helper_instance *h, int mc, int sf) {
+      if ( h->dead ) return;
+      if ( sch->debug )
+	fprintf(stderr, "LDPC helper exited: modcod=%d sf=%d\n", mc, sf);
+      h->dead = true;
+      h->b_in = h->b_out = 0;
+      free(h->pending);
+      h->pending = NULL;
+      h->pending_len = h->pending_size = 0;
+      close(h->fd_tx);
+      close(h->fd_rx);
+    }
+    // Push the staged tail of a frame into the helper.
+    // If the pipe is full, drain helper outputs first and wait for
+    // room: the helper is always either reading its input or writing
+    // output that we can drain, so this cannot deadlock.
+    // Queue the job and return 1 once the last byte is in, -1 if the
+    // helper died.
+    int push_pending(helper_instance *h, int mc, int sf) {
+      while ( h->pending_len < h->pending_size ) {
+	ssize_t w = write(h->fd_tx,
+			  ((const char*)h->pending)+h->pending_len,
+			  h->pending_size-h->pending_len);
+	if ( w < 0 ) {
+	  if ( errno == EINTR ) continue;
+	  if ( errno == EAGAIN || errno == EWOULDBLOCK ) {
+	    drain_ready();
+	    if ( h->dead ) return -1;  // Freed by mark_dead()
+	    struct pollfd pf = { h->fd_tx, POLLOUT, 0 };
+	    int pr = poll(&pf, 1, -1);
+	    if ( pr < 0 ) {
+	      if ( errno == EINTR ) continue;
+	      fatal("poll(LDPC helper)");
+	    }
+	    if ( pf.revents & (POLLERR|POLLHUP|POLLNVAL) ) {
+	      mark_dead(h, mc, sf);
+	      return -1;
+	    }
+	    continue;
+	  }
+	  if ( errno == EPIPE ) {  // Helper exited
+	    mark_dead(h, mc, sf);
+	    return -1;
+	  }
+	  fatal("write(LDPC helper)");
+	}
+	h->pending_len += w;
+      }
+      if ( jobs.full() ) {
+	drain_ready();
+	if ( h->dead ) return -1;  // Freed by mark_dead()
+	if ( jobs.full() ) return 0;  // Queue it on a later iteration
+      }
+      helper_job *job = jobs.put();
+      job->pls = h->pending_pls;
+      job->h = h;
+      job->dummy = h->pending_dummy;
+      free(h->pending);
+      h->pending = NULL;
+      h->pending_len = h->pending_size = 0;
+      note_sent(h);
+      return 1;
+    }
+    // Drain all helper results that are ready.  Used to break a
+    // potential cyclic wait before blocking on a helper input pipe.
+    void drain_ready() {
+      while ( out.writable()>=1 &&
+	      opt_writable(bitcount,1) && opt_writable(errcount,1) ) {
+	if ( ! receive_ready() ) break;
+      }
+    }
+    // Retry staged frames that are waiting for room in helper pipes.
+    void retry_pending() {
+      for ( int mc=0; mc<32; ++mc )
+	for ( int sf=0; sf<2; ++sf ) {
+	  pool *p = &pools[mc][sf];
+	  if ( ! p->procs ) continue;
+	  for ( int i=0; i<p->nprocs; ++i ) {
+	    helper_instance *h = &p->procs[i];
+	    if ( h->dead || ! h->pending ) continue;
+	    push_pending(h, mc, sf);
+	  }
+	}
+    }
+    // Write one whole frame to a helper, staging the unwritten tail
+    // in the helper context.  Writes never block: the scheduler is
+    // free to drain helper outputs before retrying.
+    // Return 1 when the frame is fully written and queued,
+    // 0 while bytes remain staged, -1 if the helper died.
+    int write_frame(helper_instance *h, const void *buf, size_t iosize,
+		    const s2_pls &pls, bool dummy, int mc, int sf) {
+      if ( ! h->pending ) {
+	h->pending = (SOFTBYTE*)malloc(iosize);
+	if ( ! h->pending ) fatal("malloc(frame)");
+	memcpy(h->pending, buf, iosize);
+	h->pending_len = 0;
+	h->pending_size = iosize;
+	h->pending_pls = pls;
+	h->pending_dummy = dummy;
+      }
+      return push_pending(h, mc, sf);
+    }
+    void note_sent(helper_instance *h) {
+      ++h->b_in;
+      if ( h->b_in >= h->batch_size ) {
+	h->b_in -= h->batch_size;
+	h->b_out += h->batch_size;
+      }
+    }
     // Try to send a frame.  Return false all helpers were busy.
     bool send_frame(fecframe<SOFTBYTE> *pin) {
       pool *p = get_pool(&pin->pls);
+      bool alive = false;
       for ( int i=0; i<p->nprocs; ++i ) {
 	helper_instance *h = &p->procs[i];
+	if ( h->dead ) continue;
+	alive = true;
+	if ( h->pending ) continue;  // Retry it on a later iteration
 	size_t iosize = (pin->pls.framebits()/8) * sizeof(SOFTBYTE);
-	// fprintf(stderr, "Writing %lu to fd %d\n", iosize, h->fd_tx);
-	int nw = write(h->fd_tx, pin->bytes, iosize);
-	if ( nw<0 && errno==EWOULDBLOCK ) continue;
-	if ( nw < 0 ) fatal("write(LDPC helper");
-	if ( nw != iosize ) fatal("partial write(LDPC helper)");
-	helper_job *job = jobs.put();
-	job->pls = pin->pls;
-	job->h = h;
-	++h->b_in;
-	if ( h->b_in >= h->batch_size ) {
-	  h->b_in -= h->batch_size;
-	  h->b_out += h->batch_size;
-	}
+	int r = write_frame(h, pin->bytes, iosize, pin->pls, false,
+			    pin->pls.modcod, pin->pls.sf);
+	if ( r == 0 ) return false;  // Staged here: do not duplicate
+	if ( r < 0 ) continue;       // Helper died: try another one
 	return true;
       }
+      if ( ! alive ) return true;  // All helpers died: discard frame
       return false;
     }
     // Return a pool of running helpers for a given modcod.
@@ -2331,6 +2572,10 @@ namespace leansdr {
       }
       h->fd_tx = tx[1];  close(tx[0]);
       h->fd_rx = rx[0];  close(rx[1]);
+      h->dead = false;
+      h->pending = NULL;
+      h->pending_len = h->pending_size = 0;
+      h->pending_dummy = false;
 #if 1
       h->batch_size = batch_size;  // Must match ldpc_tool BLOCKS
 #else
@@ -2343,13 +2588,20 @@ namespace leansdr {
     }
 
     // Receive a finished job.
-    void receive_frame(const helper_job *job) {
+    bool receive_frame(const helper_job *job) {
       // Read corrected frame from helper
       const s2_pls *pls = &job->pls;
       size_t iosize = (pls->framebits()/8) * sizeof(ldpc_buf[0]);
-      int nr = read(job->h->fd_rx, ldpc_buf, iosize);
-      if ( nr < 0 ) fatal("read(LDPC helper)");
-      if ( nr != iosize ) fatal("partial read(LDPC helper)");
+      size_t nrd = 0;
+      while ( nrd < iosize ) {
+	int nr = read(job->h->fd_rx, ((char*)ldpc_buf)+nrd, iosize-nrd);
+	if ( nr < 0 ) {
+	  if ( errno == EINTR ) continue;
+	  fatal("read(LDPC helper)");
+	}
+	if ( ! nr ) return false;  // EOF: helper is gone
+	nrd += nr;
+      }
       --job->h->b_out;
       // Decode BCH.
       const modcod_info *mcinfo = check_modcod(job->pls.modcod);
@@ -2381,12 +2633,14 @@ namespace leansdr {
       }
       if ( sch->debug )
 	fprintf(stderr, "%c", corrupted ? '!' : ncorr ? '.' : '_');
+      return true;
     }
     pipereader< fecframe<SOFTBYTE> > in;
     pipewriter<bbframe> out;
     const char *command;
     int max_iter;
     SOFTBYTE ldpc_buf[64800/8];
+    SOFTBYTE dummy_buf[64800/8];  // Padding for partial batches
     uint8_t bch_buf[64800/8];  // Temp storage for hardening before BCH
     s2_bch_engines s2bch;
     s2_bbscrambling bbscrambling;
